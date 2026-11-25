@@ -1,0 +1,38 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] [VideoPlayer] Decode the DV enhancement layer independently of the output mode
+
+CDVELDecoderDRMPRIME::Create() read the global
+videoplayer.dolbyvisionoutputmode to decide whether to open the
+enhancement layer, while the renderer reads the per-video settings: a
+per-video output-mode change (OSD) could leave the two disagreeing.
+Decode the enhancement layer whenever the user allows Dolby Vision: the
+picture is reconstructed from it before any output role (native DV,
+HDR10 or SDR), so the display's support is not this decoder's business.
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
+@@ -68,16 +68,16 @@
+       separate ? hints.doviELExtradata.GetSize() : hints.extradata.GetSize();
+   const bool hvcc = extradata && extradataSize >= 23 && extradata[0] == 1;
+ 
++  // The renderer decides how the picture goes out (native Dolby Vision, HDR10
++  // or SDR): the enhancement layer is decoded whenever the user allows Dolby
++  // Vision, for its reconstruction quality as well. The display's own support
++  // is the renderer's business, so a per-video output mode change can't leave
++  // the layer out here.
+   const auto settings = CServiceBroker::GetSettingsComponent()->GetSettings();
+   const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
+       settings->GetSetting(CSettings::SETTING_VIDEOPLAYER_ALLOWEDHDRFORMATS));
+-  const int outMode = settings->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONOUTPUTMODE);
+-  const bool dvDisplay =
+-      CServiceBroker::GetWinSystem()->GetDisplayHDRCapabilities().SupportsDolbyVision();
+-  const bool allowNativeDv =
+-      dvDisplay && CSettingUtils::FindIntInList(
+-                       allowedHdrFormats, CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION);
+-  if (!allowNativeDv && outMode == VS_DOLBYVISION_OUT_DV)
++  if (!CSettingUtils::FindIntInList(allowedHdrFormats,
++                                    CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION))
+     return nullptr;
+ 
+   std::unique_ptr<CDVELDecoderDRMPRIME> el(new CDVELDecoderDRMPRIME());

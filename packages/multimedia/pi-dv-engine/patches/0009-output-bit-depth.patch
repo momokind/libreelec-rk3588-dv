@@ -1,0 +1,191 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] Pack the tone-mapping output in 8 or 10 bits
+
+The non-tunnel output modes (HDR10 / SDR / WCG-SDR) were described as
+XRGB2101010 but P2 still quantised to 8 bits and Kodi still imported an
+XRGB8888 dma-buf. Add pi_options.output_bits: 8 keeps XRGB8888, 10 packs
+XRGB2101010 (X2R10G10B10: R<<20 | G<<10 | B), selected in P2 by a
+specialisation constant so only one packing survives compilation. The DV
+tunnel stays 8-bit, as its standard requires.
+
+Kodi chooses the depth from the mode's link budget: 10-bit RGB needs
+1.25x the 8-bit TMDS clock, and the RK3588 HDMI glue runs TMDS only
+(no FRL). The dither amplitude follows the packing (1/255 or 1/1023).
+
+diff --git a/engine/pi_engine.h b/engine/pi_engine.h
+--- a/engine/pi_engine.h
++++ b/engine/pi_engine.h
+@@ -85,8 +85,9 @@
+ 
+ /* Output signal format produced by P2:
+  *   DV_STANDARD  8-bit RGB HDMI tunnel (default, existing behaviour)
+- *   HDR10        10-bit XRGB2101010 ST.2084 PQ BT.2020
+- *   SDR          10-bit XRGB2101010 BT.2390 L1 tone-mapped SDR / WCG-SDR */
++ *   HDR10        ST.2084 PQ BT.2020, packed as output_bits says
++ *   SDR          BT.2390 L1 tone-mapped SDR / WCG-SDR, packed as output_bits says
++ * output_bits: 8 packs XRGB8888, 10 packs XRGB2101010 (the DV tunnel is always 8). */
+ enum pi_output_mode { PI_OUT_DV_STANDARD = 0, PI_OUT_HDR10 = 1, PI_OUT_SDR = 2 };
+ 
+ /* Target colour gamut for PI_OUT_SDR. */
+@@ -123,6 +124,7 @@
+     unsigned measure;             /* PI_MEASURE_* */
+     unsigned ablate;              /* p2_pack.frag ABLATE: measurement only */
+     enum pi_output_mode output_mode;
++    unsigned output_bits;         /* non-tunnel packing: 8 XRGB8888, 10 XRGB2101010 */
+     unsigned target_nits;         /* 0: auto (HDR10 passthrough / SDR 203 nits); else 50..10000 */
+     enum pi_sdr_gamut sdr_gamut;
+     enum pi_sdr_gamma sdr_gamma;
+
+diff --git a/engine/pi_engine.c b/engine/pi_engine.c
+--- a/engine/pi_engine.c
++++ b/engine/pi_engine.c
+@@ -116,10 +116,11 @@
+ enum { NB = sizeof(bindings) / sizeof(bindings[0]) };
+ 
+ /* Specialisation keys: P1's constant ids 0..15, and K1_PRE, which selects P0's
+- * shader (its METHOD, ELUP and QUAD are P1's ids); P2's 1..8. */
++ * shader (its METHOD, ELUP and QUAD are P1's ids); P2's 1..12. */
+ enum { K1_MODE, K1_METHOD, K1_DUAL, K1_KIND0, K1_KIND1, K1_ORDER0, K1_ORDER1, K1_SINGLE, K1_PIECE, K1_ORDER2,
+        K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_QUAD, K1_NV15, K1_PRE, K1_N };
+-enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_OVERLAY, K2_INTERIOR, K2_NV15, K2_OUTMODE, K2_N };
++enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_OVERLAY, K2_INTERIOR, K2_NV15, K2_OUTMODE,
++       K2_OUTBITS, K2_N };
+ enum { MAX_SPEC = 18, KEY_MAX = K1_N };
+ /* EL upscales whose vertical filter P1 does (the vertical pairs): Annex B.
+  * Bicubic's 2 column pairs are cheaper filtered in P2, and Lanczos-3's
+@@ -249,6 +250,7 @@
+         enum pi_filters filters;
+         enum pi_el_upscale el_upscale;
+         enum pi_output_mode output_mode;
++        unsigned output_bits;
+         unsigned target_nits;
+         enum pi_sdr_gamut sdr_gamut;
+         enum pi_sdr_gamma sdr_gamma;
+@@ -423,9 +425,12 @@
+                      : e->o.output_mode == PI_OUT_SDR
+                          ? (e->o.sdr_gamut == PI_GAMUT_BT2020 ? ", WCG-SDR BT.2020" : ", SDR BT.709")
+                          : "";
+-    snprintf(e->name, sizeof(e->name), "%s, MMR %s, output %s%s%s%s", e->device, mode_name(e->o.mmr),
++    const char *bits = e->o.output_mode == PI_OUT_DV_STANDARD ? ""
++                       : e->o.output_bits == 10               ? " 10-bit"
++                                                              : " 8-bit";
++    snprintf(e->name, sizeof(e->name), "%s, MMR %s, output %s%s%s%s%s", e->device, mode_name(e->o.mmr),
+              e->modifiers ? "rendered in place" : "copied",
+-             om,
++             om, bits,
+              e->o.el_upscale == PI_EL_ANNEX_B   ? ", EL Annex B"
+              : e->o.el_upscale == PI_EL_BICUBIC ? ", EL bicubic"
+              : e->o.el_upscale == PI_EL_LANCZOS ? ", EL Lanczos"
+@@ -1358,6 +1363,7 @@
+     memset(o, 0, sizeof(*o));
+     o->mmr = PI_MMR_EXACT;
+     o->filters = PI_FILTERS_CB1;
++    o->output_bits = 8;
+     o->log_level = PI_LOG_WARNING;
+ }
+ 
+@@ -1368,6 +1374,8 @@
+            (o->el_upscale == PI_EL_BILINEAR || o->el_upscale == PI_EL_ANNEX_B || o->el_upscale == PI_EL_BICUBIC ||
+             o->el_upscale == PI_EL_LANCZOS) &&
+            (o->output_mode == PI_OUT_DV_STANDARD || o->output_mode == PI_OUT_HDR10 || o->output_mode == PI_OUT_SDR) &&
++           (o->output_bits == 0 || o->output_bits == 8 || o->output_bits == 10) &&
++           (o->output_mode != PI_OUT_DV_STANDARD || o->output_bits != 10) &&
+            (o->sdr_gamut == PI_GAMUT_BT709 || o->sdr_gamut == PI_GAMUT_BT2020) &&
+            (o->sdr_gamma == PI_GAMMA_22 || o->sdr_gamma == PI_GAMMA_24);
+ }
+@@ -1381,6 +1389,7 @@
+     e->pending.filters = o->filters;
+     e->pending.el_upscale = o->el_upscale;
+     e->pending.output_mode = o->output_mode;
++    e->pending.output_bits = o->output_bits;
+     e->pending.target_nits = o->target_nits;
+     e->pending.sdr_gamut = o->sdr_gamut;
+     e->pending.sdr_gamma = o->sdr_gamma;
+@@ -1396,6 +1405,8 @@
+     if (!e)
+         return PI_E_NOMEM;
+     e->o = *o;   /* o->device is read during create only */
++    if (e->o.output_bits != 10)
++        e->o.output_bits = 8;
+     pthread_mutex_init(&e->lock, NULL);
+     pthread_cond_init(&e->wake, NULL);
+     e->cache_path = o->pipeline_cache ? strdup(o->pipeline_cache) : NULL;
+@@ -1564,6 +1575,7 @@
+         e->o.filters = e->pending.filters;
+         e->o.el_upscale = e->pending.el_upscale;
+         e->o.output_mode = e->pending.output_mode;
++        e->o.output_bits = e->pending.output_bits == 10 ? 10 : 8;
+         e->o.target_nits = e->pending.target_nits;
+         e->o.sdr_gamut = e->pending.sdr_gamut;
+         e->o.sdr_gamma = e->pending.sdr_gamma;
+@@ -1625,7 +1637,8 @@
+     }
+     e->open = 1;
+     /* P2's bars pipeline is the same for every stream */
+-    uint32_t kb[K2_N] = {[K2_BARS] = 1, [K2_OUTMODE] = (uint32_t)e->o.output_mode};
++    uint32_t kb[K2_N] = {[K2_BARS] = 1, [K2_OUTMODE] = (uint32_t)e->o.output_mode,
++                         [K2_OUTBITS] = e->o.output_bits == 10 ? 10u : 8u};
+     return build(e, 1, kb) ? 0 : PI_E_VULKAN;
+ }
+ 
+@@ -2484,6 +2497,7 @@
+     k2[K2_ELUP] = k1[K1_ELUP];
+     k2[K2_NV15] = (uint32_t)nv15;
+     k2[K2_OUTMODE] = (uint32_t)e->o.output_mode;
++    k2[K2_OUTBITS] = e->o.output_bits == 10 ? 10u : 8u;
+ }
+ 
+ struct band {
+@@ -3496,7 +3510,8 @@
+     c->stats.pass_ms[0] = c->stats.pass_ms[1] = 0;
+ 
+     /* pipelines */
+-    uint32_t k1[K1_N], k2[K2_N], kb[K2_N] = {[K2_BARS] = 1, [K2_OUTMODE] = (uint32_t)e->o.output_mode};
++    uint32_t k1[K1_N], k2[K2_N], kb[K2_N] = {[K2_BARS] = 1, [K2_OUTMODE] = (uint32_t)e->o.output_mode,
++                                             [K2_OUTBITS] = e->o.output_bits == 10 ? 10u : 8u};
+     keys(e, p, frame_is_nv15(f->bl), k1, k2);
+     uint32_t k2i[K2_N];
+     memcpy(k2i, k2, sizeof(k2i));
+@@ -3516,7 +3531,8 @@
+                     : 2 * scale->w == o->w && 2 * scale->h == o->h ? 2u
+                                                                     : 1u;
+     uint32_t k2o[K2_N], kbo[K2_N] = {[K2_BARS] = 1, [K2_OVERLAY] = mode,
+-                                     [K2_OUTMODE] = (uint32_t)e->o.output_mode};
++                                     [K2_OUTMODE] = (uint32_t)e->o.output_mode,
++                                     [K2_OUTBITS] = e->o.output_bits == 10 ? 10u : 8u};
+     memcpy(k2o, k2, sizeof(k2o));
+     k2o[K2_OVERLAY] = mode;
+     if (ov) {
+
+diff --git a/engine/shaders/p2_pack.frag b/engine/shaders/p2_pack.frag
+--- a/engine/shaders/p2_pack.frag
++++ b/engine/shaders/p2_pack.frag
+@@ -53,8 +53,11 @@
+ // the rows the metadata packets reach, so neither is tested.
+ layout(constant_id = 9) const uint INTERIOR = 0;
+ layout(constant_id = 10) const uint NV15 = 0;
+-// Output mode: 0 = DV tunnel (XRGB8888), 1 = HDR10 (XRGB2101010), 2 = SDR/WCG-SDR (XRGB2101010)
++// Output mode: 0 = DV tunnel (XRGB8888), 1 = HDR10, 2 = SDR/WCG-SDR
+ layout(constant_id = 11) const uint OUTMODE = 0;
++// Non-tunnel output packing: 8 = XRGB8888, 10 = XRGB2101010. A spec constant,
++// so only one packing survives compilation.
++layout(constant_id = 12) const uint OUTBITS = 8;
+ layout(binding = 16) uniform sampler2D overlay_codes;   // PO: (Y, Cb, Cr) x alpha / 4096, alpha
+ 
+ uint packet_byte(uint i) { return (P.packets[i >> 4][(i >> 2) & 3u] >> (8u * (i & 3u))) & 255u; }
+@@ -179,9 +182,12 @@
+             enc = pow(clamp(rgb, 0.0, 1.0), vec3(P.tm_cfg.y));
+         }
+     }
+-    float d = bayer4x4(x, y) * (1.0 / 255.0);
+-    uvec3 q = uvec3(clamp(round((enc + d) * 255.0), 0.0, 255.0));
+-    return (q.r << 16u) | (q.g << 8u) | q.b;
++    // XRGB8888 or XRGB2101010, per OUTBITS
++    float maxv = OUTBITS == 10u ? 1023.0 : 255.0;
++    float d = bayer4x4(x, y) * (1.0 / maxv);
++    uvec3 q = uvec3(clamp(round((enc + d) * maxv), 0.0, maxv));
++    return OUTBITS == 10u ? (q.r << 20u) | (q.g << 10u) | q.b
++                          : (q.r << 16u) | (q.g << 8u) | q.b;
+ }
+ 
+ uint finish(uint x, uint y, uint yy, uint c)

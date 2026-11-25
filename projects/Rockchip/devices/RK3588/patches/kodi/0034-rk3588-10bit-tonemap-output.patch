@@ -1,0 +1,346 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] [VideoPlayer] Render 10-bit HDR10/SDR output and cap its static metadata
+
+The tone-mapping output modes now scan out 10-bit RGB (XRGB2101010) where
+the mode's link has room and the video plane advertises the format: the
+RK3588 HDMI glue runs TMDS only (no FRL), so 10-bit RGB's 1.25x pixel
+clock only fits up to 4K30 (and 1080p120), and its VOP2 Esmart planes take
+no 10-bit RGB while the Cluster planes take it only AFBC-compressed, so
+linear XRGB2101010 falls back to 8-bit there. The renderer picks the
+depth from the current mode, recreates the tunnel when it changes, and
+stages the connector's max bpc accordingly (the DV tunnel keeps its own
+8-bit).
+
+For HDR10 output, cap the static metadata at target_nits when the engine
+tone-maps: the source's mastering peak and MaxCLL/MaxFALL would make the
+sink tone-map a second time. The per-frame RPU L1 tone mapping is the
+engine's; the static metadata should describe what is left of it.
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+@@ -51,6 +51,8 @@
+     pi_filters filters = PI_FILTERS_CB1;
+     pi_el_upscale elUpscale = PI_EL_BILINEAR;
+     pi_output_mode outputMode = PI_OUT_DV_STANDARD;
++    //! non-tunnel output packing: 8 (XRGB8888) or 10 (XRGB2101010); the tunnel is always 8
++    unsigned int outputBits = 8;
+     unsigned int targetNits = 0;
+     pi_sdr_gamut sdrGamut = PI_GAMUT_BT709;
+     pi_sdr_gamma sdrGamma = PI_GAMMA_22;
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+@@ -275,6 +275,7 @@
+   o.filters = options.filters;
+   o.el_upscale = options.elUpscale;
+   o.output_mode = options.outputMode;
++  o.output_bits = options.outputBits;
+   o.target_nits = options.targetNits;
+   o.sdr_gamut = options.sdrGamut;
+   o.sdr_gamma = options.sdrGamma;
+@@ -320,8 +321,9 @@
+   bytes = (bytes + 4095) & ~static_cast<uint64_t>(4095);
+ 
+   tunnel->m_pool = std::make_shared<CDVTunnelOutputPool>();
+-  const uint32_t drmFormat = DRM_FORMAT_XRGB8888;
+-  const uint8_t colorBits = 8;
++  const bool tenBit = options.outputBits == 10;
++  const uint32_t drmFormat = tenBit ? DRM_FORMAT_XRGB2101010 : DRM_FORMAT_XRGB8888;
++  const uint8_t colorBits = tenBit ? 10 : 8;
+   for (int i = 0; i < OUTPUTS; i++)
+   {
+     int fd = AllocateDmaBuf(bytes);
+@@ -617,6 +619,7 @@
+   o.filters = options.filters;
+   o.el_upscale = options.elUpscale;
+   o.output_mode = options.outputMode;
++  o.output_bits = options.outputBits;
+   o.target_nits = options.targetNits;
+   o.sdr_gamut = options.sdrGamut;
+   o.sdr_gamma = options.sdrGamma;
+@@ -775,13 +778,15 @@
+   info["Info.ChromaMapping"] =
+       m_mmr ? StringUtils::Format("MMR · {}", MMRName(m_options.mmr)) : "Polynomial";
+   info["Info.Filters"] = m_options.filters == PI_FILTERS_PHASE ? "Phase" : "CB1";
++  const unsigned int bits = m_options.outputBits == 10 ? 10 : 8;
+   if (m_options.outputMode == PI_OUT_HDR10)
+     info["Info.Link"] = m_options.targetNits > 0
+-                            ? StringUtils::Format("HDR10 10-bit PQ ({} nits)", m_options.targetNits)
+-                            : "HDR10 10-bit PQ";
++                            ? StringUtils::Format("HDR10 {}-bit PQ ({} nits)", bits,
++                                                  m_options.targetNits)
++                            : StringUtils::Format("HDR10 {}-bit PQ", bits);
+   else if (m_options.outputMode == PI_OUT_SDR)
+     info["Info.Link"] = StringUtils::Format(
+-        "10-bit {} ({} nits, {})",
++        "{}-bit {} ({} nits, {})", bits,
+         m_options.sdrGamut == PI_GAMUT_BT2020 ? "WCG-SDR BT.2020" : "SDR BT.709",
+         m_options.targetNits > 0 ? m_options.targetNits : 203u,
+         m_options.sdrGamma == PI_GAMMA_24 ? "Gamma 2.4" : "Gamma 2.2");
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+@@ -40,6 +40,8 @@
+ #include <chrono>
+ #include <vector>
+ 
++#include <drm_fourcc.h>
++
+ using namespace KODI::WINDOWING::GBM;
+ 
+ CRendererDRMPRIME::~CRendererDRMPRIME()
+@@ -57,6 +59,7 @@
+   winSystem->SetGuiCompositing(false);
+   winSystem->SetHDR(nullptr);
+   winSystem->SetColorimetry(nullptr);
++  winSystem->RestoreOutputBitDepth();
+   winSystem->SetDolbyVision(DolbyVisionOutput::OFF);
+ }
+ 
+@@ -209,7 +212,26 @@
+   return areas;
+ }
+ 
+-CDVTunnelDRMPRIME::Options GetDolbyVisionOptions(const CVideoSettings& settings)
++/*!
++ * \brief Whether 10-bit RGB fits the mode's link.
++ *
++ * The RK3588 HDMI glue still runs TMDS only (no FRL): 600 MHz pixel clock
++ * ceiling. 10-bit RGB costs 1.25x the 8-bit clock; the blanking is taken
++ * generously at 1.5x the active pixel rate (4K24 ~1.5x, 4K60 ~1.2x).
++ */
++bool TenBitOutputFits(const RESOLUTION_INFO& info)
++{
++  if (info.iScreenWidth == 0 || info.iScreenHeight == 0 || info.fRefreshRate <= 0.0f)
++    return false;
++
++  const double clock =
++      1.5 * info.iScreenWidth * info.iScreenHeight * static_cast<double>(info.fRefreshRate);
++  return clock * 1.25 <= 600.0e6;
++}
++
++CDVTunnelDRMPRIME::Options GetDolbyVisionOptions(const CVideoSettings& settings,
++                                                unsigned int width,
++                                                unsigned int height)
+ {
+   auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
+   const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
+@@ -251,6 +273,17 @@
+       }
+       break;
+   }
++  // 10-bit RGB scanout where the link has room and the video plane takes it;
++  // the tunnel is always 8-bit
++  if (options.outputMode != PI_OUT_DV_STANDARD && winSystem)
++  {
++    const RESOLUTION_INFO& info = winSystem->GetGfxContext().GetResInfo();
++    const unsigned int outHeight = std::max<unsigned int>(height, (width * 9 / 16) & ~1u);
++    if (TenBitOutputFits(info) &&
++        winSystem->SupportsVideoPlaneFormat(width, outHeight, DRM_FORMAT_XRGB2101010,
++                                            DRM_FORMAT_MOD_LINEAR))
++      options.outputBits = 10;
++  }
+   options.targetNits =
+       static_cast<unsigned int>(std::clamp(settings.m_DolbyVisionTargetNits, 0, 10000));
+   options.sdrGamma = settings.m_DolbyVisionSDRGamma == VS_DOLBYVISION_GAMMA_24 ? PI_GAMMA_24
+@@ -322,7 +355,8 @@
+ {
+ #if defined(HAVE_PIDV)
+   auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
+-  const CDVTunnelDRMPRIME::Options options = GetDolbyVisionOptions(m_videoSettings);
++  const CDVTunnelDRMPRIME::Options options =
++      GetDolbyVisionOptions(m_videoSettings, picture.iWidth, picture.iHeight);
+   if (!m_dolbyVisionCapable)
+   {
+     const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
+@@ -351,6 +385,8 @@
+ 
+   if (options.outputMode == PI_OUT_DV_STANDARD)
+   {
++    // the tunnel asks for its own depth: drop the tone-mapped output's
++    winSystem->RestoreOutputBitDepth();
+     if (!winSystem->SetDolbyVision(GetDolbyVisionInfoframe(m_videoSettings)))
+     {
+       m_dolbyVision.reset();
+@@ -361,18 +397,39 @@
+   else if (options.outputMode == PI_OUT_HDR10)
+   {
+     winSystem->SetDolbyVision(DolbyVisionOutput::OFF);
++    winSystem->SetOutputBitDepth(options.outputBits);
+     VideoPicture hdrPic;
+     hdrPic.Reset();
+     hdrPic.SetParams(picture);
+     hdrPic.color_transfer = AVCOL_TRC_SMPTE2084;
+     hdrPic.color_primaries = AVCOL_PRI_BT2020;
+     hdrPic.color_space = AVCOL_SPC_BT2020_NCL;
++    // The engine tone-maps each picture from its RPU L1: static metadata that
++    // promises more light than the tone mapping leaves would make the sink map
++    // a second time.
++    if (options.targetNits > 0)
++    {
++      const double cap = static_cast<double>(options.targetNits);
++      if (hdrPic.hasDisplayMetadata)
++      {
++        const double sourcePeak = av_q2d(hdrPic.displayMetadata.max_luminance);
++        if (sourcePeak <= 0.0 || sourcePeak > cap)
++          hdrPic.displayMetadata.max_luminance = AVRational{static_cast<int>(options.targetNits), 1};
++      }
++      if (hdrPic.hasLightMetadata)
++      {
++        const auto max = static_cast<unsigned int>(options.targetNits);
++        hdrPic.lightMetadata.MaxCLL = std::min(hdrPic.lightMetadata.MaxCLL, max);
++        hdrPic.lightMetadata.MaxFALL = std::min(hdrPic.lightMetadata.MaxFALL, max);
++      }
++    }
+     winSystem->SetColorimetry(&hdrPic);
+     m_hdrOutput = winSystem->SetHDR(&hdrPic);
+   }
+   else
+   {
+     winSystem->SetDolbyVision(DolbyVisionOutput::OFF);
++    winSystem->SetOutputBitDepth(options.outputBits);
+     VideoPicture sdrPic;
+     sdrPic.Reset();
+     sdrPic.SetParams(picture);
+@@ -386,6 +443,13 @@
+     m_hdrOutput = false;
+   }
+ 
++  if (options.outputMode == PI_OUT_DV_STANDARD)
++    CLog::Log(LOGINFO, "CRendererDRMPRIME: Dolby Vision output: 8-bit tunnel");
++  else
++    CLog::Log(LOGINFO, "CRendererDRMPRIME: Dolby Vision output: {} {}",
++              options.outputMode == PI_OUT_HDR10 ? "HDR10" : "SDR",
++              options.outputBits == 10 ? "10-bit" : "8-bit");
++
+   m_dolbyVisionMismatches = 0;
+   winSystem->SetGuiCompositing(false);
+   SetGuiCapture(true);
+@@ -402,8 +466,9 @@
+ #if defined(HAVE_PIDV)
+   SetGuiCapture(false);
+   m_dolbyVision.reset();
+-  static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem())
+-      ->SetDolbyVision(DolbyVisionOutput::OFF);
++  auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++  winSystem->RestoreOutputBitDepth();
++  winSystem->SetDolbyVision(DolbyVisionOutput::OFF);
+   SetHDROutput(picture);
+   // the bridge reconfigures the plane and connector for the decoder's buffers
+   m_iLastRenderBuffer = -1;
+@@ -432,9 +497,10 @@
+   if (!m_dolbyVision)
+     return;
+ 
+-  const CDVTunnelDRMPRIME::Options options = GetDolbyVisionOptions(m_videoSettings);
++  const CDVTunnelDRMPRIME::Options options =
++      GetDolbyVisionOptions(m_videoSettings, picture.iWidth, picture.iHeight);
+   const CDVTunnelDRMPRIME::Options& current = m_dolbyVision->GetOptions();
+-  if (options.outputMode != current.outputMode ||
++  if (options.outputMode != current.outputMode || options.outputBits != current.outputBits ||
+       (options.outputMode == PI_OUT_SDR && options.sdrGamut != current.sdrGamut))
+   {
+     SetGuiCapture(false);
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -90,6 +90,23 @@
+   DolbyVisionOutput GetDolbyVisionDefaultOutput() const;
+ 
+   /*!
++   * \brief Requests the connector's max bpc for a non-tunnel output (HDR10/SDR
++   * on the video plane): 10-bit scanout needs it. The first request saves the
++   * connector's value; RestoreOutputBitDepth() puts it back.
++   * \return false if the connector has no max bpc property
++   */
++  bool SetOutputBitDepth(unsigned int bits);
++  //! \brief Restores the max bpc SetOutputBitDepth() changed, if it did
++  void RestoreOutputBitDepth();
++
++  /*!
++   * \brief Whether the selected video plane can scan out a framebuffer of this format and
++   * modifier at this size: the tone-mapped output's 10-bit RGB depends on it.
++   */
++  bool SupportsVideoPlaneFormat(uint64_t width, uint64_t height, uint32_t format,
++                                uint64_t modifier);
++
++  /*!
+    * \brief Render the GUI into a texture and leave it out of the GUI plane, for a renderer
+    * that composites it into the video itself (the Dolby Vision tunnel: graphics over the
+    * tunnel's frame would be decoded as its signal)
+@@ -138,6 +155,7 @@
+   DolbyVisionOutput m_dolbyVision = DolbyVisionOutput::OFF;
+   std::optional<uint64_t> m_dolbyVisionSavedBroadcastRGB;
+   std::optional<uint64_t> m_dolbyVisionSavedMaxBpc;
++  std::optional<uint64_t> m_outputSavedMaxBpc;
+ 
+   std::unique_ptr<UTILS::CDisplayInfo> m_info;
+ };
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -731,10 +731,59 @@
+   drm->SetGuiPlaneTop(output != DolbyVisionOutput::OFF ? 8 : 0);
+   drm->SetActive(true);
+   m_dolbyVision = output;
++
++  return true;
++}
++
++bool CWinSystemGbm::SetOutputBitDepth(unsigned int bits)
++{
++  auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  if (!drm)
++    return false;
++
++  auto connector = drm->GetConnector();
++  if (!connector || !connector->SupportsProperty("max bpc"))
++    return false;
+ 
++  // the first value seen is the one to restore, as for the tunnel's
++  if (!m_outputSavedMaxBpc)
++    m_outputSavedMaxBpc = connector->GetPropertyValue("max bpc");
++
++  CLog::LogF(LOGDEBUG, "setting connector max bpc to {}", bits);
++  drm->AddProperty(connector, "max bpc", bits);
++  drm->SetActive(true);
+   return true;
+ }
+ 
++void CWinSystemGbm::RestoreOutputBitDepth()
++{
++  auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  if (!drm || !m_outputSavedMaxBpc)
++    return;
++
++  auto connector = drm->GetConnector();
++  if (connector && connector->SupportsProperty("max bpc"))
++  {
++    CLog::LogF(LOGDEBUG, "restoring connector max bpc to {}", m_outputSavedMaxBpc.value());
++    drm->AddProperty(connector, "max bpc", m_outputSavedMaxBpc.value());
++    drm->SetActive(true);
++  }
++  m_outputSavedMaxBpc.reset();
++}
++
++bool CWinSystemGbm::SupportsVideoPlaneFormat(uint64_t width,
++                                             uint64_t height,
++                                             uint32_t format,
++                                             uint64_t modifier)
++{
++  auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  if (!drm)
++    return false;
++
++  CDRMPlane* plane = drm->GetVideoPlane();
++  return plane && plane->Check(width, height, format, modifier, drm->GetCrtc(), PLANE_TYPE_ANY);
++}
++
+ DolbyVisionOutput CWinSystemGbm::GetDolbyVisionDefaultOutput() const
+ {
+   if (m_info && m_info->GetDolbyVisionStandardVersion() == 2)
