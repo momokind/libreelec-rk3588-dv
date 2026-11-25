@@ -69,7 +69,7 @@
 ### 分阶段实施 Checklist
 - [x] **Phase 1（DV → HDR10）**：`pi-dv-engine 0008` 支持 `PI_OUT_HDR10` + 有序抖动 `XRGB8888` 打包（YCbCr 零往返直通 + Profile 5 `IPTPQc2` 矩阵解码 + 可选 L1 BT.2390 峰值映射），Kodi `0031` 放宽非 DV 显示器门控与 Profile 7 EL 解码，实机验证 `p5-sample.mkv` 正确输出 `HDR10`、`Colorspace = BT2020_RGB (9)`、`max bpc = 10`、`Dolby Vision = Off (0)`、`plane 50` 活跃且 FD 稳定在 110
 - [x] **Phase 2（DV → SDR / WCG-SDR + L1 BT.2390 DTM）**：在 `p2_pack.frag` 实现逐帧 RPU L1 BT.2390 动态色调映射、Gamma 2.2/2.4 与 BT.2020/BT.709 矩阵及 4×4 Bayer 有序抖动；实机验证 `DV P5 → SDR BT.709`（`Colorspace = 0`）与 `DV P5 → WCG-SDR BT.2020`（`Colorspace = 9`）均 `rendered in place` 正常播放，切回 `Auto` 正常恢复原生 DV（`Dolby Vision = 2`）
-- [ ] **Phase 3（可选扩展）**：接入普通 HDR10 / HDR Vivid（`0020`）片源，统一通过 `pi-dv-engine` 输出到 SDR/WCG-SDR，补齐非 HDR 设备全片源画质增强
+- [x] **Phase 3（静态 HDR10 → DV P8.1 / SDR 统一接入）**：新增 `0036-videoplayer-hdr10-to-dolby-vision.patch` 与设置项 `videoplayer.dolbyvisionfromhdr10`（默认关闭，可在 **Player → Videos → Dolby Vision → HDR10 as Dolby Vision** 开启），利用静态 `AVMasteringDisplayMetadata` + `MaxCLL`/`MaxFALL` 生成 Profile 8.1 RPU 接入 `pi-dv-engine`，同时支持静态 HDR10 转 DV 输出及 HDR10 → SDR/WCG-SDR 动态色调映射，已在 `192.168.1.180` 完成 `make image` 编译验证
 
 ---
 
