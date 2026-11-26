@@ -504,6 +504,10 @@ devices = \
         'config': 'khadas-edge2-rk3588s_defconfig',
         'dtb': ''
       },
+      'lubancat-5': {
+        'config': 'generic-rk3588_defconfig',
+        'dtb': 'rk3588-lubancat-5.dtb'
+      },
       'nanopc-t6': {
         'config': 'nanopc-t6-rk3588_defconfig',
         'dtb': ''
